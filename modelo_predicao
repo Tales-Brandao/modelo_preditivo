@@ -1,0 +1,289 @@
+import datetime as dt
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import MaxAbsScaler
+from sklearn.metrics import mean_absolute_error
+from neuralprophet import NeuralProphet
+import torch.nn as nn
+from scipy import stats
+import warnings
+import os
+import sys
+from tqdm import tqdm
+
+# Configuração de ambiente
+warnings.filterwarnings("ignore")
+pd.set_option('display.max_columns', None)
+
+class TimeSeriesForecaster:
+    """
+    Classe responsável pela previsão de séries temporais utilizando o modelo NeuralProphet.
+    Realiza todo o processo de preparação de dados, modelagem e pós-processamento.
+    """
+    
+    def __init__(self, n_days_back=0, forecast_horizon=48):
+        """
+        Inicializa o forecast com parâmetros temporais básicos.
+        
+        Parâmetros:
+            n_days_back (int): Número de dias retroativos para início da análise
+            forecast_horizon (int): Horizonte de previsão em horas
+        """
+        self.n_days_back = n_days_back
+        self.forecast_horizon = forecast_horizon
+        self._setup_dates()
+        self.scaler = MaxAbsScaler()
+        self.model = None
+        self.forecast = None
+        
+    def _setup_dates(self):
+        """Configura todas as variáveis de data necessárias para o processo."""
+        today = dt.date.today() - dt.timedelta(days=self.n_days_back)
+        self.current_date = today.strftime("%d-%m-%Y")
+        self.start_date = (today - dt.timedelta(days=5)).strftime("%Y-%m-%d")
+        self.end_date = today.strftime("%Y-%m-%d")
+        self.date_range = [
+            dt.datetime.strptime(self.start_date, "%Y-%m-%d").date() + dt.timedelta(days=x)
+            for x in range((dt.datetime.strptime(self.end_date, "%Y-%m-%d").date() - 
+                          dt.datetime.strptime(self.start_date, "%Y-%m-%d").date()).days + 1)
+        ]
+
+    def load_simulation_data(self):
+        """
+        Carrega dados para simulação a partir da fonte de dados.
+        Atribui o resultado ao atributo simulation_data.
+        """
+        # Exemplo: pd.read_sql("SELECT ...", connection)
+        self.simulation_data = pd.DataFrame()  # Substituir pela carga real
+        self.simulation_data.columns = map(str.upper, self.simulation_data.columns)
+        print("Dados de simulação carregados:", self.simulation_data.shape)
+
+    def load_hyperparameters(self):
+        """
+        Carrega hiperparâmetros para o modelo a partir da fonte de dados.
+        Retorna dicionário com parâmetros formatados.
+        """
+        # Exemplo: pd.read_sql("SELECT HIPERPARAMETROS, VALOR FROM ...", connection)
+        param_df = pd.DataFrame({
+            'HIPERPARAMETROS': ['epochs', 'seasonality_mode', 'n_forecasts'],
+            'VALOR': ['50', 'multiplicative', '90']
+        })  # Substituir pela carga real
+        
+        param_dict = {}
+        for _, row in param_df.iterrows():
+            key = row['HIPERPARAMETROS']
+            value = row['VALOR']
+            
+            if value.lower() == 'true':
+                param_dict[key] = True
+            elif value.lower() == 'false':
+                param_dict[key] = False
+            elif 'nn.' in value:
+                param_dict[key] = getattr(nn, value.split('.')[1])
+            else:
+                try:
+                    param_dict[key] = float(value) if '.' in value else int(value)
+                except ValueError:
+                    param_dict[key] = value
+        
+        return param_dict
+
+    def _create_eom_boost(self, df):
+        """
+        Cria feature de final de mês baseada nos 5 maiores valores históricos.
+        
+        Parâmetros:
+            df (DataFrame): DataFrame com dados temporais
+        """
+        df['end_of_month_boost'] = 0
+        penultimate_month = df['ds'].dt.to_period("M").unique()[-2]
+        
+        top_days = df[df['ds'].dt.to_period("M") == penultimate_month]['y'].nlargest(5)
+        for idx in top_days.index:
+            if df.loc[idx, 'ds'].day_name() == 'Saturday':
+                df.loc[idx - 1, 'end_of_month_boost'] = 1
+            else:
+                df.loc[idx, 'end_of_month_boost'] = 1
+
+    def _prepare_data(self, item_id):
+        """
+        Prepara dados para modelagem com tratamento específico por item.
+        
+        Parâmetros:
+            item_id (str): Identificador do item para carga de dados
+        """
+        # Exemplo: pd.read_sql(f"SELECT ... WHERE item = {item_id}", connection)
+        df = pd.DataFrame({
+            'DATA_EMISSAO': pd.date_range(start='2023-01-01', periods=100),
+            'QTDE': np.random.randint(50, 200, size=100)
+        })  # Substituir pela carga real
+        
+        df.rename(columns={'DATA_EMISSAO': 'ds', 'QTDE': 'y'}, inplace=True)
+        df_scaled = df.copy()
+        df_scaled['y'] = self.scaler.fit_transform(df[['y']])
+        self._create_eom_boost(df_scaled)
+        return df_scaled
+
+    def _configure_model(self, params):
+        """
+        Configura o modelo NeuralProphet com os hiperparâmetros fornecidos.
+        
+        Parâmetros:
+            params (dict): Dicionário de hiperparâmetros
+        """
+        quantiles = [0.025, 0.975]  # Intervalo de 95% de confiança
+        
+        self.model = NeuralProphet(
+            n_forecasts=params['n_forecasts'],
+            epochs=params['epochs'],
+            seasonality_mode=params['seasonality_mode'],
+            quantiles=quantiles
+        )
+        
+        self.model.add_country_holidays(
+            "BRA",
+            mode=params['seasonality_mode'],
+            lower_window=-1,
+            upper_window=1,
+            regularization=params.get('regularization_feriados', 0.5)
+        )
+        
+        self.model.add_events(
+            events=['end_of_month_boost'],
+            regularization=params.get('regularizacao_ultimos_tres_meses', 0.5),
+            mode=params['seasonality_mode']
+        )
+
+    def _postprocess_forecast(self, forecast, historical_data):
+        """
+        Realiza pós-processamento das previsões incluindo transformação inversa
+        e cálculo de intervalos de confiança ajustados.
+        
+        Parâmetros:
+            forecast (DataFrame): Resultados brutos da previsão
+            historical_data (DataFrame): Dados históricos originais
+        """
+        # Transformação inversa da normalização
+        for col in ['y', 'yhat1', 'yhat1 2.5%', 'yhat1 97.5%']:
+            if col in forecast.columns:
+                forecast[col] = self.scaler.inverse_transform(forecast[[col]])
+        
+        # Garantia de valores positivos
+        forecast['yhat1'] = forecast['yhat1'].abs()
+        forecast['yhat1 97.5%'] = forecast['yhat1 97.5%'].abs()
+        forecast['yhat1 2.5%'] = forecast['yhat1 2.5%'].abs()
+        
+        # Cálculo de métricas de validação
+        valid_data = forecast.dropna(subset=['y'])
+        mae = mean_absolute_error(valid_data['y'], valid_data['yhat1'])
+        value_range = valid_data['y'].max() - valid_data['y'].min()
+        self.accuracy = max(0, min(100 * (1 - mae/value_range), 100))
+        
+        return forecast[['ds', 'y', 'yhat1', 'yhat1 2.5%', 'yhat1 97.5%']]
+
+    def _calculate_risk_metrics(self, df):
+        """
+        Calcula métricas de risco baseadas em distribuição normal.
+        
+        Parâmetros:
+            df (DataFrame): DataFrame com dados históricos e previsões
+        """
+        window_size = 90
+        df['rolling_mean'] = df['y'].rolling(window_size).mean()
+        df['rolling_std'] = df['y'].rolling(window_size).std()
+        
+        current_metrics = df.iloc[-1]
+        mean_val = current_metrics['rolling_mean']
+        std_val = current_metrics['rolling_std']
+        
+        # Gera pontos ao redor da média para avaliação de risco
+        step_size = max(1, int(0.1 * mean_val))
+        values = np.arange(
+            mean_val - 5 * step_size,
+            mean_val + 6 * step_size,
+            step_size
+        )
+        
+        # Cálculo das probabilidades cumulativas
+        for i, value in enumerate(values, 1):
+            df[f'Meta_{i}x_Media'] = value
+            df[f'Risco_Meta_{i}x_Media'] = stats.norm.cdf(
+                value, 
+                loc=df['rolling_mean'], 
+                scale=df['rolling_std']
+            ) * 100
+            
+            df[f'Risco_Meta_{i}x_Projecao'] = stats.norm.cdf(
+                value, 
+                loc=df['yhat1'].fillna(0), 
+                scale=df['rolling_std']
+            ) * 100
+        
+        df['DT_ATUALIZACAO'] = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return df
+
+    def execute_forecast(self, item_id):
+        """
+        Executa o fluxo completo de previsão para um item específico.
+        
+        Parâmetros:
+            item_id (str): Identificador do item a ser processado
+        """
+        try:
+            # 1. Preparação de dados
+            params = self.load_hyperparameters()
+            data = self._prepare_data(item_id)
+            
+            # 2. Configuração e treinamento do modelo
+            self._configure_model(params)
+            self.model.fit(data, freq='D', epochs=params['epochs'])
+            
+            # 3. Geração de previsões
+            future = self.model.make_future_dataframe(
+                data, 
+                periods=params['n_forecasts'], 
+                n_historic_predictions=True
+            )
+            self._create_eom_boost(future)
+            raw_forecast = self.model.predict(future)
+            
+            # 4. Pós-processamento
+            processed_forecast = self._postprocess_forecast(raw_forecast, data)
+            final_results = self._calculate_risk_metrics(processed_forecast)
+            
+            print(f"Previsão concluída para {item_id} | Acurácia: {self.accuracy:.2f}%")
+            return final_results
+        
+        except Exception as e:
+            print(f"Erro no processamento de {item_id}: {str(e)}")
+            return None
+
+# Fluxo principal de execução
+if __name__ == "__main__":
+    print('Iniciando processo de previsão...')
+    
+    # Configuração inicial
+    forecaster = TimeSeriesForecaster(n_days_back=0, forecast_horizon=48)
+    forecaster.load_simulation_data()
+    
+    # Exemplo de processamento para múltiplos itens
+    items_to_process = ['item001', 'item002', 'item003']  # Lista real de itens
+    
+    all_results = []
+    for item in tqdm(items_to_process, desc="Processando itens"):
+        result = forecaster.execute_forecast(item)
+        if result is not None:
+            all_results.append(result)
+    
+    # Consolida resultados (exemplo)
+    if all_results:
+        final_df = pd.concat(all_results)
+        print("Processo concluído. Resultados consolidados:")
+        print(final_df.info())
+        
+        # Persistência dos dados (exemplo)
+        # final_df.to_sql('resultados_previsao', con=engine, if_exists='append')
+    else:
+        print("Processo finalizado sem resultados")
+    
+    print('Carga de dados concluída')
