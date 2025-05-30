@@ -1,0 +1,337 @@
+import datetime as dt
+import pandas as pd
+import numpy as np
+import torch.nn as nn
+import optuna
+from sklearn.metrics import mean_absolute_error
+from sklearn.preprocessing import MaxAbsScaler
+from sklearn.model_selection import train_test_split
+from neuralprophet import NeuralProphet
+from tqdm import tqdm
+import warnings
+import os
+
+# Configuração de ambiente
+warnings.filterwarnings("ignore")
+pd.set_option('display.max_columns', None)
+
+class HyperparameterOptimizer:
+    """
+    Classe responsável pela otimização de hiperparâmetros para modelos de previsão de séries temporais.
+    Implementa técnicas de busca automatizada e validação de modelos.
+    """
+    
+    def __init__(self, n_days_back=0):
+        """
+        Inicializa o otimizador com parâmetros temporais básicos.
+        
+        Parâmetros:
+            n_days_back (int): Número de dias retroativos para início da análise
+        """
+        self.n_days_back = n_days_back
+        self._setup_dates()
+        self.scaler = MaxAbsScaler()
+        self.best_params = None
+        self.best_accuracy = 0.0
+        
+    def _setup_dates(self):
+        """Configura todas as variáveis de data necessárias para o processo."""
+        today = dt.date.today() - dt.timedelta(days=self.n_days_back)
+        self.current_date = today.strftime("%d-%m-%Y")
+        self.start_date = (today - dt.timedelta(days=5)).strftime("%Y-%m-%d")
+        self.end_date = today.strftime("%Y-%m-%d")
+        self.monitoring_date = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _create_eom_boost(self, df):
+        """
+        Adiciona feature de final de mês baseada nos 5 maiores valores históricos.
+        
+        Parâmetros:
+            df (DataFrame): DataFrame com dados temporais
+        """
+        df['end_of_month_boost'] = 0
+        for month_period, month_df in df.groupby(df['ds'].dt.to_period("M")):
+            top_indices = month_df['y'].nlargest(5).index
+            for idx in top_indices:
+                if df.loc[idx, 'ds'].day_name() == 'Saturday':
+                    boost_idx = idx - 1
+                else:
+                    boost_idx = idx
+                df.loc[boost_idx, 'end_of_month_boost'] = 1
+
+    def load_time_series_data(self, item_id):
+        """
+        Carrega e prepara dados de séries temporais para um item específico.
+        
+        Parâmetros:
+            item_id (str): Identificador do item
+            
+        Retorna:
+            DataFrame: Dados processados
+        """
+        # Carregar dados da fonte original (ex: banco de dados)
+        # df = pd.read_sql(f"SELECT ... WHERE item = {item_id}", connection)
+        df = pd.DataFrame({
+            'DATA': pd.date_range(start='2023-01-01', periods=100),
+            'QTDE': np.random.randint(50, 200, size=100)
+        })
+        
+        # Preparação dos dados
+        df.rename(columns={'DATA': 'ds', 'QTDE': 'y'}, inplace=True)
+        
+        # Preencher datas faltantes
+        full_date_range = pd.DataFrame({
+            'ds': pd.date_range(start=df['ds'].min(), end=df['ds'].max())
+        })
+        df = pd.merge(full_date_range, df, on='ds', how='left')
+        df.sort_values('ds', inplace=True)
+        
+        # Normalização
+        df['y_scaled'] = self.scaler.fit_transform(df[['y']])
+        self._create_eom_boost(df)
+        
+        return df
+
+    def _create_trial_params(self, trial):
+        """
+        Define os parâmetros para um trial de otimização.
+        
+        Parâmetros:
+            trial (optuna.Trial): Objeto trial da otimização
+            
+        Retorna:
+            dict: Dicionário de parâmetros
+        """
+        return {
+            'learning_rate': trial.suggest_float('learning_rate', 0.001, 0.1, log=True),
+            'trend_reg': trial.suggest_float('trend_reg', 0.001, 1.0),
+            'ar_reg': trial.suggest_float('ar_reg', 0.1, 10.0),
+            'epochs': trial.suggest_int('epochs', 10, 50),
+            'seasonality_reg': trial.suggest_float('seasonality_reg', 0.1, 10.0),
+            'n_changepoints': trial.suggest_int('n_changepoints', 5, 30),
+            'seasonality_mode': trial.suggest_categorical('seasonality_mode', ['additive', 'multiplicative']),
+            'yearly_seasonality': trial.suggest_categorical('yearly_seasonality', [True, False]),
+            'weekly_seasonality': trial.suggest_categorical('weekly_seasonality', [True, False]),
+            'daily_seasonality': trial.suggest_categorical('daily_seasonality', [True, False]),
+            'n_forecasts': 1,  # Fixo para previsão de 1 passo à frente
+            'loss_func': nn.L1Loss,
+            'regularizacao_ultimos_tres_meses': trial.suggest_float('regularizacao_ultimos_tres_meses', 1e-5, 1e-1),
+            'regularization_feriados': trial.suggest_float('regularization_feriados', 0.1, 10.0)
+        }
+
+    def _create_model(self, params):
+        """
+        Cria e configura o modelo NeuralProphet com os parâmetros especificados.
+        
+        Parâmetros:
+            params (dict): Dicionário de parâmetros do modelo
+            
+        Retorna:
+            NeuralProphet: Modelo configurado
+        """
+        model = NeuralProphet(
+            n_forecasts=params['n_forecasts'],
+            n_lags=30,
+            yearly_seasonality=params['yearly_seasonality'],
+            weekly_seasonality=params['weekly_seasonality'],
+            daily_seasonality=params['daily_seasonality'],
+            seasonality_mode=params['seasonality_mode'],
+            seasonality_reg=params['seasonality_reg'],
+            trend_reg=params['trend_reg'],
+            ar_reg=params['ar_reg'],
+            learning_rate=params['learning_rate'],
+            loss_func=params['loss_func'],
+            n_changepoints=params['n_changepoints']
+        )
+        
+        # Adicionar eventos e feriados
+        model.add_events(
+            events=['end_of_month_boost'],
+            regularization=params['regularizacao_ultimos_tres_meses'],
+            mode=params['seasonality_mode']
+        )
+        
+        model.add_country_holidays(
+            "BRA",
+            mode=params['seasonality_mode'],
+            lower_window=-1,
+            upper_window=1,
+            regularization=params['regularization_feriados']
+        )
+        
+        return model
+
+    def _calculate_accuracy(self, y_true, y_pred):
+        """
+        Calcula a acurácia percentual baseada no erro absoluto médio normalizado.
+        
+        Parâmetros:
+            y_true (array): Valores reais
+            y_pred (array): Valores previstos
+            
+        Retorna:
+            float: Acurácia percentual
+        """
+        mae = mean_absolute_error(y_true, y_pred)
+        value_range = max(y_true) - min(y_true)
+        return max(0, min(100 * (1 - (mae / value_range), 100))
+
+    def _objective(self, trial, data, item_id):
+        """
+        Função objetivo para otimização de hiperparâmetros.
+        
+        Parâmetros:
+            trial (optuna.Trial): Objeto trial
+            data (DataFrame): Dados completos
+            item_id (str): Identificador do item
+            
+        Retorna:
+            float: Valor da métrica a ser otimizada
+        """
+        # Divisão treino-teste
+        train, test = train_test_split(data, test_size=0.2, shuffle=False)
+        
+        # Criar e treinar modelo
+        params = self._create_trial_params(trial)
+        model = self._create_model(params)
+        model.fit(train, freq='D', epochs=params['epochs'])
+        
+        # Fazer previsões
+        future = model.make_future_dataframe(train, periods=len(test))
+        forecast = model.predict(future)
+        
+        # Calcular métricas
+        merged = test.merge(forecast, on='ds', how='left')
+        accuracy = self._calculate_accuracy(
+            merged['y_scaled'].fillna(0), 
+            merged['yhat1'].fillna(0)
+        )
+        
+        # Critério de parada antecipada
+        if accuracy > 99:
+            self.best_params = params
+            self.best_accuracy = accuracy
+            raise optuna.exceptions.TrialPruned("Acurácia superior a 99% atingida")
+            
+        return mean_absolute_error(merged['y_scaled'], merged['yhat1'])
+
+    def optimize_hyperparameters(self, item_id, n_trials=50):
+        """
+        Executa o processo de otimização de hiperparâmetros para um item específico.
+        
+        Parâmetros:
+            item_id (str): Identificador do item
+            n_trials (int): Número de tentativas de otimização
+            
+        Retorna:
+            tuple: (DataFrame com resultados, acurácia final)
+        """
+        try:
+            # Carregar dados
+            data = self.load_time_series_data(item_id)
+            
+            # Configurar estudo de otimização
+            study = optuna.create_study(direction='minimize')
+            study.optimize(
+                lambda trial: self._objective(trial, data, item_id), 
+                n_trials=n_trials,
+                catch=(optuna.exceptions.TrialPruned,)
+            )
+            
+            # Resultados finais
+            if self.best_params is None:
+                self.best_params = study.best_params
+                self.best_accuracy = self._calculate_final_accuracy(data, self.best_params)
+                
+            results_df = self._create_results_dataframe(item_id)
+            return results_df, self.best_accuracy
+            
+        except Exception as e:
+            print(f"Erro na otimização para {item_id}: {str(e)}")
+            return None, 0.0
+
+    def _calculate_final_accuracy(self, data, params):
+        """
+        Calcula a acurácia final com os melhores parâmetros em todos os dados.
+        
+        Parâmetros:
+            data (DataFrame): Dados completos
+            params (dict): Melhores parâmetros encontrados
+            
+        Retorna:
+            float: Acurácia percentual
+        """
+        model = self._create_model(params)
+        model.fit(data, freq='D', epochs=params['epochs'])
+        
+        # Previsão dentro da amostra
+        future = model.make_future_dataframe(data, periods=0)
+        forecast = model.predict(future)
+        
+        # Calcular acurácia
+        merged = data.merge(forecast, on='ds', how='left')
+        return self._calculate_accuracy(
+            merged['y_scaled'], 
+            merged['yhat1']
+        )
+
+    def _create_results_dataframe(self, item_id):
+        """
+        Cria DataFrame com resultados da otimização.
+        
+        Parâmetros:
+            item_id (str): Identificador do item
+            
+        Retorna:
+            DataFrame: Resultados formatados
+        """
+        if self.best_params is None:
+            return pd.DataFrame()
+            
+        # Preparar dados para DataFrame
+        records = []
+        for param, value in self.best_params.items():
+            # Converter tipos especiais para representação string
+            if callable(value):
+                str_value = value.__name__ if hasattr(value, '__name__') else str(value)
+            else:
+                str_value = str(value)
+                
+            records.append({
+                'HIPERPARAMETRO': param,
+                'VALOR': str_value,
+                'ITEM': item_id,
+                'DATA_OTIMIZACAO': self.monitoring_date,
+                'ACURACIA': self.best_accuracy
+            })
+            
+        return pd.DataFrame(records)
+
+# Fluxo principal de execução
+if __name__ == "__main__":
+    print("Iniciando processo de otimização de hiperparâmetros...")
+    
+    # Configuração
+    optimizer = HyperparameterOptimizer(n_days_back=0)
+    items_to_optimize = ['item001', 'item002', 'item003']  # Lista de itens a processar
+    
+    # Processar cada item
+    all_results = []
+    for item in tqdm(items_to_optimize, desc="Otimizando itens"):
+        result_df, accuracy = optimizer.optimize_hyperparameters(item, n_trials=50)
+        if result_df is not None:
+            all_results.append(result_df)
+            print(f"Item {item} otimizado | Acurácia: {accuracy:.2f}%")
+    
+    # Consolidar resultados
+    if all_results:
+        final_results = pd.concat(all_results, ignore_index=True)
+        print("\nResumo da otimização:")
+        print(final_results.groupby('ITEM')['ACURACIA'].max())
+        
+        # Persistência dos resultados (exemplo)
+        # final_results.to_sql('resultados_otimizacao', con=engine, if_exists='append')
+    else:
+        print("Nenhum resultado foi gerado")
+    
+    print("Processo de otimização concluído")
